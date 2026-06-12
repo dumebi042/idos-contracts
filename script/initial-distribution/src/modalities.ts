@@ -1,0 +1,63 @@
+// Null means no vesting contract is needed.
+export const MODALITIES = {
+  "FCL Months 2-6": ["2026-03-05T15:00:00Z", "2026-04-05T15:00:00Z", "2026-08-05T15:00:00Z"],
+  "SM - 0 - 12": ["2026-02-05T15:00:00Z", "2026-03-05T15:00:00Z", "2027-02-05T15:00:00Z"],
+  "SM - 1 - 5": ["2026-03-05T15:00:00Z", "2026-04-05T15:00:00Z", "2026-08-05T15:00:00Z"],
+  "SM - 1 - 6 - 20%": ["2026-03-05T15:00:00Z", "2026-04-05T15:00:00Z", "2026-09-05T15:00:00Z"],
+  "SM - 1 - 6": ["2026-03-05T15:00:00Z", "2026-04-05T15:00:00Z", "2026-09-05T15:00:00Z"],
+  "SM - 12 - 24": ["2027-02-05T15:00:00Z", "2027-03-05T15:00:00Z", "2029-02-05T15:00:00Z"],
+  "SM - 12 - 36": ["2027-02-05T15:00:00Z", "2027-03-05T15:00:00Z", "2030-02-05T15:00:00Z"],
+  "SM - 6 - 12": ["2026-08-05T15:00:00Z", "2026-09-05T15:00:00Z", "2027-08-05T15:00:00Z"],
+  "SM - 6 - 24": ["2026-08-05T15:00:00Z", "2026-09-05T15:00:00Z", "2028-08-05T15:00:00Z"],
+  Masterlist: null,
+} as const;
+type ModalityScriptDisbursed = keyof typeof MODALITIES;
+
+/** Modalities disbursed manually by other processes; scripts must ignore these. */
+export const MODALITIES_NOT_DISBURSED_BY_OUR_SCRIPT = [
+  "C - 12 - 36",
+  "C - 6 - 36",
+  "Treasury",
+  "Staking Rewards",
+] as const;
+type ModalityNotScriptDisbursed = (typeof MODALITIES_NOT_DISBURSED_BY_OUR_SCRIPT)[number];
+
+export type Modality = ModalityScriptDisbursed | ModalityNotScriptDisbursed;
+
+export function isScriptDisbursedModality(m: Modality): boolean {
+  return !(MODALITIES_NOT_DISBURSED_BY_OUR_SCRIPT as readonly string[]).includes(m);
+}
+
+// Mirrors the Solidity `enum Modality` in TDEDisbursement.sol.
+export const EVMModality = {
+  DIRECT: 0,
+  VESTED_0_12: 1,
+  VESTED_0_120: 2,
+  VESTED_1_5: 3,
+  VESTED_1_6: 4,
+  VESTED_1_60: 5,
+  VESTED_6_12: 6,
+  VESTED_6_24: 7,
+  VESTED_12_24: 8,
+  VESTED_12_36: 9,
+} as const;
+export type EVMModality = (typeof EVMModality)[keyof typeof EVMModality];
+
+export const MODALITIES_TS_TO_EVM: Record<ModalityScriptDisbursed, EVMModality> = {
+  "FCL Months 2-6": 3,
+  "SM - 0 - 12": 1,
+  "SM - 1 - 5": 3,
+  "SM - 1 - 6 - 20%": 4,
+  "SM - 1 - 6": 4,
+  "SM - 12 - 24": 8,
+  "SM - 12 - 36": 9,
+  "SM - 6 - 12": 6,
+  "SM - 6 - 24": 7,
+  Masterlist: 0,
+};
+
+export function isKnownModality(s: string): s is Modality {
+  return (
+    s in MODALITIES || (MODALITIES_NOT_DISBURSED_BY_OUR_SCRIPT as readonly string[]).includes(s)
+  );
+}

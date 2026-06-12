@@ -1,0 +1,350 @@
+import { tqdm } from "@thesephist/tsqdm";
+import "dotenv/config";
+import { type Address, formatEther, getAddress, getContract, type Hex } from "viem";
+import { ccaAbi, erc20Abi, tdeDisbursementAbi, trackerAbi } from "./abis.js";
+import { buildExpectedEntries, type DisbursementEntry } from "./ccaEntries.js";
+import { chainSetup, makeWallet } from "./chains.js";
+import {
+  assertCondition,
+  blockToTimestamp,
+  contractHasCode,
+  ensureHex,
+  findFirstBlockAtOrAfter,
+  iso8601ToTimestamp,
+  paginatedGetEvents,
+  receiptFor,
+  requiredArgs,
+  requireEnv,
+  sumOf,
+  zip,
+} from "./lib.js";
+
+// -- Configuration and sanity checks ──────────────────────────────────────────
+
+const CHAIN_ID = requireEnv("CHAIN_ID");
+const TRACKER_TOKEN_ADDRESS = getAddress(requireEnv("TRACKER_TOKEN_ADDRESS"));
+const CCA_ADDRESS = getAddress(requireEnv("CCA_ADDRESS"));
+const SOLD_TOKEN_ADDRESS = getAddress(requireEnv("SOLD_TOKEN_ADDRESS"));
+const TDE_DISBURSEMENT_ADDRESS = getAddress(requireEnv("TDE_DISBURSEMENT_ADDRESS"));
+const NORMAL_PHASE_START = iso8601ToTimestamp(requireEnv("NORMAL_PHASE_START"));
+const TDE_DISBURSER_PRIVATE_KEY = ensureHex(requireEnv("TDE_DISBURSER_PRIVATE_KEY"));
+const TRACKER_DISBURSER_PRIVATE_KEY = ensureHex(requireEnv("TRACKER_DISBURSER_PRIVATE_KEY"));
+const RPC_URL = requireEnv("RPC_URL");
+
+const { chain, transport, publicClient } = await chainSetup(CHAIN_ID, RPC_URL);
+
+const tdeDisburser = makeWallet(chain, transport, TDE_DISBURSER_PRIVATE_KEY);
+const trackerDisburser = makeWallet(chain, transport, TRACKER_DISBURSER_PRIVATE_KEY);
+
+const ccaContract = getContract({
+  address: CCA_ADDRESS,
+  abi: ccaAbi,
+  client: publicClient,
+});
+
+const soldTokenContract = getContract({
+  address: SOLD_TOKEN_ADDRESS,
+  abi: erc20Abi,
+  client: tdeDisburser.walletClient,
+});
+
+const tdeDisbursementContract = getContract({
+  address: TDE_DISBURSEMENT_ADDRESS,
+  abi: tdeDisbursementAbi,
+  client: tdeDisburser.walletClient,
+});
+
+const trackerContract = getContract({
+  address: TRACKER_TOKEN_ADDRESS,
+  abi: trackerAbi,
+  client: trackerDisburser.walletClient,
+});
+
+for (const contract of [ccaContract, trackerContract, soldTokenContract, tdeDisbursementContract]) {
+  assertCondition(
+    await contractHasCode(publicClient, contract),
+    `No contract code on address ${contract.address} on chain ${chain.id}.`,
+  );
+}
+console.log(`✅ All contracts addresses have deployed code.`);
+
+const onChainTrackerDisburser = getAddress(await trackerContract.read.disburser());
+assertCondition(
+  onChainTrackerDisburser === trackerDisburser.account.address,
+  `${trackerDisburser.account.address} is not the CCADisbursementTracker disburser (expected ${onChainTrackerDisburser}).`,
+);
+console.log(`✅ CCADisbursementTracker disburser address matches: ${onChainTrackerDisburser}`);
+
+const onChainTDEDisburser = getAddress(await tdeDisbursementContract.read.DISBURSER());
+assertCondition(
+  onChainTDEDisburser === tdeDisburser.account.address,
+  `${tdeDisburser.account.address} is not the TDEDisbursement disburser (expected ${onChainTDEDisburser}).`,
+);
+console.log(`✅ TDEDisbursement disburser address matches: ${onChainTDEDisburser}`);
+
+// ── 1. Fetch CCA data, resolve phase boundary, compute filled bids ──────────
+
+const ccaStartBlock = await ccaContract.read.startBlock();
+const ccaEndBlock = await ccaContract.read.endBlock();
+const currentBlock = await publicClient.getBlockNumber();
+
+assertCondition(
+  currentBlock >= ccaEndBlock,
+  `CCA end block is in the future. We're at block ${currentBlock} and need to wait for block ${ccaEndBlock} to be mined.`,
+);
+console.log(`✅ CCA sale has ended.`);
+
+const phaseBoundaryBlock = await findFirstBlockAtOrAfter(
+  NORMAL_PHASE_START,
+  ccaStartBlock,
+  ccaEndBlock,
+  async (blockNumber) => blockToTimestamp(publicClient, blockNumber),
+);
+const phaseBoundaryTimestamp = await blockToTimestamp(publicClient, phaseBoundaryBlock);
+assertCondition(
+  ccaStartBlock <= phaseBoundaryBlock && phaseBoundaryBlock <= ccaEndBlock,
+  `Phase boundary block is out of range: ${phaseBoundaryBlock} is not between ${ccaStartBlock} and ${ccaEndBlock}.`,
+);
+console.log(
+  `✅ Normal phase boundary block found: ${phaseBoundaryBlock}, at ${new Date(Number(phaseBoundaryTimestamp) * 1000).toISOString()}`,
+);
+
+assertCondition(
+  await trackerContract.read.saleFullyClaimed(),
+  "Sale is not fully claimed yet. Wait for all claimTokens and sweepUnsoldTokens to be called.",
+);
+console.log(`✅ CCA sale has been fully claimed.`);
+
+const [bidLogs, claimLogs, sweepLogs] = await Promise.all([
+  paginatedGetEvents((r) => ccaContract.getEvents.BidSubmitted({}, r), ccaStartBlock, ccaEndBlock),
+  paginatedGetEvents((r) => ccaContract.getEvents.TokensClaimed({}, r), ccaEndBlock, currentBlock),
+  paginatedGetEvents((r) => ccaContract.getEvents.TokensSwept({}, r), ccaEndBlock, currentBlock),
+]);
+
+assertCondition(
+  sweepLogs.length > 0,
+  "No TokensSwept event found. This should never happen, since the tracker should have recorded the sweep.",
+);
+console.log(`✅ CCA sale has been swept.`);
+
+const sweepLog = requiredArgs(sweepLogs[0]);
+const sweep = {
+  recipient: getAddress(sweepLog.tokensRecipient),
+  amount: sweepLog.tokensAmount,
+};
+
+const bidSubmissions = bidLogs.map((l) => {
+  const { id: bidId, owner } = requiredArgs(l);
+  return { bidId, owner, blockNumber: l.blockNumber };
+});
+
+// TokensClaimed is the only event that matters for token amounts. BidExited
+// records the same tokensFilled value earlier (during exit), but the actual
+// token transfer (and thus the tracker's MissingDisbursementRecorded) only
+// happens at claim time. Outbid bids may have tokensFilled = 0; we ignore those.
+const tokensClaims = claimLogs.map((l) => requiredArgs(l)).filter((tc) => tc.tokensFilled > 0n);
+
+const bidSubmissionById = new Map(bidSubmissions.map((o) => [o.bidId, o]));
+
+const claimsWithoutSubmission = tokensClaims.filter((tc) => !bidSubmissionById.has(tc.bidId));
+assertCondition(
+  !claimsWithoutSubmission.length,
+  `TokensClaimed events without matching BidSubmitted: ${claimsWithoutSubmission.map((tc) => tc.bidId).join(", ")}`,
+);
+console.log(`✅ All tokens claims have matching bid submissions.`);
+
+const filledBids = tokensClaims.map((tc) => {
+  // biome-ignore lint/style/noNonNullAssertion: asserted above that all claims have a submission.
+  const b = bidSubmissionById.get(tc.bidId)!;
+  return {
+    bidId: b.bidId,
+    owner: getAddress(b.owner),
+    bidBlockNumber: b.blockNumber,
+    tokensFilled: tc.tokensFilled,
+  };
+});
+
+// -- Execution functions ─────────────────────────────────────────────────────
+
+async function ensureTdeAllowance(totalNeeded: bigint): Promise<void> {
+  const currentAllowance = await soldTokenContract.read.allowance([
+    tdeDisburser.account.address,
+    TDE_DISBURSEMENT_ADDRESS,
+  ]);
+  if (currentAllowance >= totalNeeded) return;
+
+  await receiptFor(
+    publicClient,
+    await soldTokenContract.write.approve([TDE_DISBURSEMENT_ADDRESS, totalNeeded]),
+  );
+}
+
+async function executeTdeDisburse(to: Address, amount: bigint, modality: number): Promise<Hex> {
+  return (
+    await receiptFor(
+      publicClient,
+      await tdeDisbursementContract.write.disburse([to, amount, modality]),
+    )
+  ).transactionHash;
+}
+
+async function executeTransfer(to: Address, amount: bigint): Promise<Hex> {
+  return (await receiptFor(publicClient, await soldTokenContract.write.transfer([to, amount])))
+    .transactionHash;
+}
+
+async function recordOnTracker(to: Address, ccaAmount: bigint, txHash: Hex): Promise<Hex> {
+  return (
+    await receiptFor(
+      publicClient,
+      await trackerContract.write.recordDisbursement([to, ccaAmount, txHash]),
+    )
+  ).transactionHash;
+}
+
+async function findUnrecordedTransfer(
+  entry: DisbursementEntry,
+  fromBlock: bigint,
+  toBlock: bigint,
+): Promise<Hex | null> {
+  if (entry.kind === "tde") {
+    const logs = await publicClient.getContractEvents({
+      address: TDE_DISBURSEMENT_ADDRESS,
+      abi: tdeDisbursementAbi,
+      eventName: "Disbursed",
+      args: { beneficiary: entry.to },
+      fromBlock,
+      toBlock,
+    });
+    const match = logs.find(
+      (l) => l.args.amount === entry.transferAmount && l.args.modality === entry.modality,
+    );
+    if (!match) return null;
+    return match.transactionHash;
+  }
+
+  const logs = await soldTokenContract.getEvents.Transfer(
+    { from: tdeDisburser.account.address, to: entry.to },
+    { fromBlock, toBlock },
+  );
+  const match = logs.find((l) => l.args.value === entry.transferAmount);
+  if (!match) return null;
+  return match.transactionHash;
+}
+
+function executeEntry(entry: DisbursementEntry): Promise<Hex> {
+  if (entry.kind === "tde")
+    return executeTdeDisburse(entry.to, entry.transferAmount, entry.modality);
+  return executeTransfer(entry.to, entry.transferAmount);
+}
+
+// ── 2. Compute the full expected entry list ─────────────────────────────────
+
+const expectedEntries = buildExpectedEntries(filledBids, phaseBoundaryBlock, sweep);
+
+// ── 3. Reconcile on-chain tracker recordings against expected entries ────────
+//
+// DisbursementCompleted events are the single source of truth for progress.
+// Each entry produces one transfer (or whale disburse) and one tracker recording,
+// always in that order. If we crash between the two, we detect the unrecorded
+// transfer on the next run and resume from the tracker recording step.
+
+const disbursementLogs = await paginatedGetEvents(
+  (r) => trackerContract.getEvents.DisbursementCompleted({}, r),
+  ccaEndBlock,
+  currentBlock,
+);
+
+assertCondition(
+  disbursementLogs.length <= expectedEntries.length,
+  `Idempotency broken: found ${disbursementLogs.length} DisbursementCompleted events but only ${expectedEntries.length} entries expected.`,
+);
+console.log(`✅ All already recorded disbursement logs have matching expected entries.`);
+
+for (const [i, [expected, log]] of zip(expectedEntries, disbursementLogs).entries()) {
+  const { to: rawTo, value } = requiredArgs(log);
+  const to = getAddress(rawTo);
+
+  assertCondition(
+    to === expected.to && value === expected.ccaAmount,
+    `Idempotency broken at entry ${i} (${expected.kind}):\n` +
+      `  expected: to=${expected.to}, ccaAmount=${expected.ccaAmount}\n` +
+      `  on-chain: to=${to}, value=${value}`,
+  );
+}
+console.log(`✅ All already recorded disbursement logs match expected entries.`);
+
+// ── 4. Execute remaining entries and record on tracker ──────────────────────-
+
+const remainingEntries = expectedEntries.slice(disbursementLogs.length);
+
+if (remainingEntries.length > 0) {
+  // Crash recovery: the previous run may have executed the transfer for the
+  // first remaining entry but crashed before recording it on the tracker.
+  // Search from the last recorded event's block to minimize false positives.
+  const recoveryFromBlock =
+    disbursementLogs.length === 0
+      ? ccaEndBlock
+      : disbursementLogs[disbursementLogs.length - 1].blockNumber;
+  const recoveredTxHash = await findUnrecordedTransfer(
+    remainingEntries[0],
+    recoveryFromBlock,
+    currentBlock,
+  );
+  if (recoveredTxHash) {
+    const entry = remainingEntries[0];
+    remainingEntries.shift();
+    await recordOnTracker(entry.to, entry.ccaAmount, recoveredTxHash);
+  }
+
+  const remainingTokenTotal = sumOf(remainingEntries.map((e) => e.transferAmount));
+  const disburserBalance = await soldTokenContract.read.balanceOf([tdeDisburser.account.address]);
+  assertCondition(
+    disburserBalance >= remainingTokenTotal,
+    `${tdeDisburser.account.address} has insufficient token balance of ${soldTokenContract.address}. Has ${formatEther(disburserBalance)}, needs ${formatEther(remainingTokenTotal)}.`,
+  );
+  console.log(`✅ Disburser has sufficient token balance.`);
+
+  const tdeTotal = sumOf(
+    remainingEntries.filter((e) => e.kind === "tde").map((e) => e.transferAmount),
+  );
+  if (tdeTotal > 0n) await ensureTdeAllowance(tdeTotal);
+
+  for await (const entry of tqdm(remainingEntries, { label: "Disbursing" })) {
+    const txHash = await executeEntry(entry);
+    await recordOnTracker(entry.to, entry.ccaAmount, txHash);
+  }
+  console.log(`✅ All remaining entries disbursed.`);
+} else {
+  console.log(`✅ No remaining entries to disburse.`);
+}
+
+// ── Final state and sweep ────────────────────────────────────────────────────
+
+assertCondition(
+  await trackerContract.read.saleFullyDisbursed(),
+  "Sale is not fully disbursed. This should never happen.",
+);
+console.log(`✅ Sale is fully disbursed.`);
+
+const finalDisburserBalance = await soldTokenContract.read.balanceOf([
+  tdeDisburser.account.address,
+]);
+const sweepTarget = await ccaContract.read.tokensRecipient();
+if (finalDisburserBalance > 0n) {
+  console.log(
+    `🚧 Sweeping remaining balance (${formatEther(finalDisburserBalance)} tokens) to ${sweepTarget} ...`,
+  );
+  await receiptFor(
+    publicClient,
+    await soldTokenContract.write.transfer([sweepTarget, finalDisburserBalance]),
+  );
+
+  assertCondition(
+    (await soldTokenContract.read.balanceOf([tdeDisburser.account.address])) === 0n,
+    `Sweep failed: disburser balance is not 0 after sweep. This should never happen.`,
+  );
+  console.log(`✅ No remaining tokens on disburser.`);
+}
+
+console.log(`✅ Run completed successfully.`);
