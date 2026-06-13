@@ -1,7 +1,7 @@
 # Submission: Full Unstake Removes Node Record Required by `slash()`
 
 **Target:** IDOSNodeStaking.sol
-**Severity:** Medium (candidate)
+**Severity:** Low / duplicate-risk candidate
 **Type:** Business Logic / Slashing Design Flaw
 
 ## Description
@@ -10,7 +10,7 @@ The protocol retains unstaked funds for a 14-day unbonding/slashing penalty wind
 
 ## Impact
 
-Funds that the protocol intentionally retains for a 14-day slashing window can escape slashing. The node identity is not permanently immune — if new stake arrives, it becomes slashable again — but the pending unstaked funds are permanently protected.
+Funds that the protocol intentionally retains for a 14-day slashing window can escape a later slash if the node's active stake is reduced to zero before `slash(node)` is called. The node identity is not permanently immune — if new stake arrives, it becomes slashable again — but the already-pending unstake can be withdrawn after the delay.
 
 ## Attack Sequence
 
@@ -24,10 +24,10 @@ Funds that the protocol intentionally retains for a 14-day slashing window can e
 
 File: [`test/AuditPoC_Wave3.t.sol`](test/AuditPoC_Wave3.t.sol) — 12 test sequences.
 
-Core PoC (`test_F2_Sequence1_FullUnstakeDuringDelay`):
+Core PoC (`test_F2_Sequence1_FullUnstakeSlashDuringDelayUserWithdraws`):
 
 ```solidity
-function test_F2_Sequence1_FullUnstakeDuringDelay() public {
+function test_F2_Sequence1_FullUnstakeSlashDuringDelayUserWithdraws() public {
     uint256 stakeAmount = 500;
 
     // Stake to node
@@ -58,7 +58,7 @@ function test_F2_Sequence1_FullUnstakeDuringDelay() public {
 
 ## Comparison with Prior Audit
 
-Nethermind Finding 6.5 describes partial unstake (funds escape slashing via reduced stake). This finding describes the distinct scenario where full unstake causes `slash()` to revert entirely — a governance bypass, not just fund escape.
+Nethermind Finding 6.5 already describes the broader issue: `unstake()` reduces `stakeByNode`, pending unstakes are dissociated from the node, `Unstake` does not store node identity, and `withdrawSlashedStakes()` cannot recover those pending amounts. This report is therefore best framed as a concrete edge-case reproduction of that acknowledged issue: when the full active node balance is unstaked, `slash(node)` itself reverts with `NodeIsUnknown` until new stake is added.
 
 ## Scope Consideration
 
@@ -80,7 +80,7 @@ The pending amounts are stored only by user, without their originating node.
 After a full unstake, `stakeByNode` no longer contains the node, and the
 contract cannot identify which pending unstakes belong to it.
 
-**Minimal mitigation — track node in `Unstake`:**
+**Required building block — track node in `Unstake`:**
 
 ```solidity
 struct Unstake {
@@ -90,13 +90,16 @@ struct Unstake {
 }
 ```
 
-Then pending unstaked amounts remain attributable to their node and can be
-slashed until `UNSTAKE_DELAY` expires. The `slash()` function would iterate
-the slashed node's users and confiscate pending amounts still within the
-delay window.
+This is necessary for attribution, but it is not sufficient by itself. The
+contract also needs bounded accounting that lets `slash(node)` include
+pending unstakes without iterating every user.
 
-**Alternative — do not remove node from `stakeByNode` on unstake:**
+**Practical bounded design:**
 
-Keep the node in `stakeByNode` even when balance reaches zero, so
-`slash()` always has a valid target. Track "active stake" via a separate
-counter.
+- Store `node`, `amount`, `timestamp`, and a slashed/withdrawn status per pending unstake.
+- Maintain node-level pending totals, e.g. `pendingUnstakeByNode[node]`, updated on unstake and withdrawal.
+- Let `slash(node)` slash `activeStakeByNode[node] + pendingUnstakeByNode[node]` and mark the node slashed at the slash timestamp.
+- In `withdrawUnstaked()`, skip or reduce pending entries whose node was slashed before the request matured, routing those amounts to a protocol slashed-pending pool.
+- Keep owner withdrawal based on explicit slashed active and slashed pending totals rather than iterating users.
+
+Keeping zero-value nodes in `stakeByNode` may keep `slash(node)` callable, but it does not by itself make pending withdrawal balances slashable or withdrawable by the protocol.

@@ -2,15 +2,15 @@
 
 ## Test Suite Results
 
-| Category                    | Count |
-| --------------------------- | ----- |
-| Total test functions        | 249   |
-| Existing project tests      | 124   |
-| New audit tests (Waves 1-3) | 125   |
-| Passing                     | 248   |
-| Failing                     | 1     |
+| Category                              | Count / Result |
+| ------------------------------------- | -------------- |
+| Test/invariant entries discovered     | 249            |
+| Existing project entries              | 124            |
+| New audit entries (Waves 1-3)         | 125            |
+| First `forge test --summary` execution | 190 passed / 1 failed |
+| First `forge test -vvv` execution      | 147 passed / 1 failed |
 
-_(Counts from `forge test --list`; the single failure is `IDOSVestingTest:test_WorksWithCliff`)_
+_(Discovery counts from `forge test --list`. The requested execution runs stopped/cancelled remaining work after the same failing test: `IDOSVestingTest:test_WorksWithCliff`.)_
 
 **Existing project tests (124):**
 
@@ -34,11 +34,11 @@ _(Counts from `forge test --list`; the single failure is `IDOSVestingTest:test_W
 | `CCADisbursementTrackerStateMachineTest` (Wave 2d) | 16    | ✅ All pass                   |
 | `TDEDisbursementBoundaryTest` (Wave 2e)            | 8     | ✅ All pass                   |
 | `AuditPoC_Wave3` (Wave 3 F1+F2 deepening)          | 24    | ✅ All pass                   |
-| `StakingInvariantTest` (Wave 3 Phase 4)            | 3     | ✅ Ghost handler, 128k+ calls |
+| `StakingInvariantTest` (Wave 3 Phase 4)            | 3     | ✅ Foundry invariant handler  |
 | `Wave3Invariants` (Wave 3 Phases 4-6)              | 31    | ✅ All pass                   |
 | `AuditPoC_Wave3_CCA_Vesting` (Wave 3 Phases 7-9)   | 14    | ✅ All pass                   |
 
-**Status:** Pre-existing test incompatibility observed under the audit's `via-IR` compilation configuration; no production exploit identified.
+**Status:** Pre-existing vesting test expectation mismatch observed under the audit configuration; no production exploit identified.
 
 ## Findings
 
@@ -52,7 +52,7 @@ _(Counts from `forge test --list`; the single failure is `IDOSVestingTest:test_W
 
 **Test coverage:** 12 PoC tests in [`test/AuditPoC_Wave3.t.sol`](test/AuditPoC_Wave3.t.sol) — all scenarios confirmed with external balance assertions.
 
-### F2: Full Unstake Removes Node from `stakeByNode`, Making `slash()` Unreachable — **Medium candidate / Extension of NM-6.5**
+### F2: Full Unstake Removes Node from `stakeByNode`, Making `slash()` Unreachable — **Low / Duplicate-risk Extension of NM-6.5**
 
 When the final staker—or coordinated stakers representing a node's entire active
 stake—fully unstakes, [`stakeByNode.remove(node)`](src/IDOSNodeStaking.sol:156)
@@ -71,7 +71,7 @@ makes funds already held by the protocol unreachable by the slashing mechanism.
 - ❌ The node identity — can be slashed again if new stake arrives
 - ❌ Future stakes — always slashable
 
-**Scope-exclusion risk:** The programme's "Transaction ordering" exclusion
+**Novelty and scope risk:** Nethermind 6.5 already describes the broader pending-unstake slashing bypass, including the missing node attribution in `Unstake`. This report is best treated as a concrete edge-case reproduction rather than a clearly novel standalone finding. The programme's "Transaction ordering" exclusion
 (line 111 of `idOS-bounty-info.md`) may apply. The defence is that the
 vulnerability is a design flaw in the unbonding/slashing interaction, not
 generic mempool front-running.
@@ -86,8 +86,8 @@ generic mempool front-running.
 ### Wave 2 — Deep Testing (6 areas)
 
 - Staking accounting invariants — 3 tests, all invariants hold
-- Reward fuzzing — 256 runs, all match reference model
-- Reward-pool solvency — No insolvency was observed across the tested slashing, reward-withdrawal and pending-unstake scenarios.
+- Reward fuzzing — isolated W2b rerun exposed a counterexample where withdrawable rewards exceed the current contract balance after owner-funded rewards are paid out; this remains a separate solvency/funding hypothesis, not a submission-ready attacker finding.
+- Reward-pool solvency — deterministic W2c scenarios did not prove an additional submission-ready issue.
 - CCA state machine — 16 tests, non-terminal `saleFullyDisbursed()` documented
 - TDE vesting boundaries — 8 tests, all 10 modalities verified
 - BatchCaller EIP-7702 — 14 tests, guard correct
@@ -96,8 +96,8 @@ generic mempool front-running.
 
 - **Phase 1**: Baseline — exact test totals, via-IR-specific test incompatibility investigated; no production defect identified
 - **Phase 2**: F1 deepened — **12 scenarios confirmed, F1 classified as Medium**
-- **Phase 3**: F2 deepened — **12 sequences confirmed, F2 classified as Medium candidate with scope-exclusion risk**
-- **Phase 4**: Stateful invariants — Ghost accounting handler, 128k+ calls, no violations
+- **Phase 3**: F2 deepened — **12 sequences confirmed, F2 classified as Low / duplicate-risk with scope-exclusion risk**
+- **Phase 4**: Stateful invariants — Ghost accounting handler exercised under Foundry invariant runs; no submission-ready new issue from these invariants
 - **Phase 5**: Reward differential — Reference model matches contract for 13/15 sequences (R8/R9 divergences expected — slashing logic)
 - **Phase 6**: Slashing accounting — 10 scenarios, `slashedStakeWithdrawn` cannot double-count/underflow/drain pending funds
 - **Phase 7**: CCA integration — No external consumers treat `saleFullyDisbursed()` as terminal. `disbursementsToRange()` safe against overflow.
@@ -109,7 +109,7 @@ generic mempool front-running.
 | Finding                                                     | Defensible classification                                           |
 | ----------------------------------------------------------- | ------------------------------------------------------------------- |
 | F1: Force-staking                                           | Medium, novel                                                       |
-| F2: Full unstake removes the node entry required by slash() | Medium candidate / extension, with scope-exclusion risk             |
+| F2: Full unstake removes the node entry required by slash() | Low / duplicate-risk extension, with scope-exclusion risk           |
 | Other in-scope contracts                                    | No exploitable issue found in tested paths                          |
 | Audit status                                                | Testing complete; report normalization and submission review remain |
 
@@ -142,7 +142,7 @@ forge test --match-contract TDEDisbursementBoundary -vvv
 2. **CCA submodule**: The CCA library has its own audits (OpenZeppelin, Spearbit, ABDK). We did not re-audit the CCA itself.
 3. **Initial distribution scripts**: The TypeScript scripts in `script/initial-distribution/` were reviewed for function usage but not for correctness of the off-chain computation.
 4. **Owner trust model**: The owner can pause, slash, and withdraw slashed funds. This is by design but represents a centralization risk.
-5. **`via_ir = true`**: Required for the audit test suite due to stack depth in complex test functions. The single failing test (`IDOSVestingTest:test_WorksWithCliff`) is a pre-existing test incompatibility observed under the audit's `via-IR` compilation configuration; no production exploit identified. Foundry 1.5.1 resolves prior 0-test-detection issues.
+5. **`via_ir = true`**: Required for the audit test suite due to stack depth in complex test functions. The failing vesting test (`IDOSVestingTest:test_WorksWithCliff`) is a stale expectation around cliff release semantics; no production exploit identified. Foundry 1.5.1 still shows execution-count instability after failures, so `forge test --list` discovery counts should be separated from executed-test counts.
 
 ## Remaining Untested Areas
 
